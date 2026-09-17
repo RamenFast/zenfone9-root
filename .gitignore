@@ -25,3 +25,6 @@ src/cheese_scan
 src/call_capset
 src/pa_leak
 src/host_kallsyms
+
+# local device config
+device.env

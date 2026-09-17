@@ -4,7 +4,8 @@
 # NOTE: each MISS can perform 4-byte writes to wild physical addresses and may panic
 # the kernel (observed). Bounded batches only.
 set -u
-S=${ZF9_SERIAL:?set ZF9_SERIAL to your device serial}
+[ -f "$(dirname "$0")/../device.env" ] && . "$(dirname "$0")/../device.env"
+S=${ZF9_SERIAL:?set ZF9_SERIAL (or create device.env)}
 BIN=${BIN:-/data/local/tmp/cheese}
 LOGDIR=$HOME/Dev/zenfone9-root/logs/sweep3-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$LOGDIR"

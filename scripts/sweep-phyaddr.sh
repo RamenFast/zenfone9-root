@@ -3,7 +3,8 @@
 # Serial-pinned. Each candidate: fresh run, kernel-log fault telemetry captured.
 # Safety: device is airplane/offline, spare, media-backup verified. cheese restores kernel text on exit.
 set -u
-S=${ZF9_SERIAL:?set ZF9_SERIAL to your device serial}
+[ -f "$(dirname "$0")/../device.env" ] && . "$(dirname "$0")/../device.env"
+S=${ZF9_SERIAL:?set ZF9_SERIAL (or create device.env)}
 FB=$HOME/Dev/zenfone9-root/artifacts/sdk/platform-tools/fastboot   # unused here; adb only
 LOGDIR=$HOME/Dev/zenfone9-root/logs/sweep-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$LOGDIR"

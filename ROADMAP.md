@@ -122,6 +122,24 @@ Cross-check: `init_task.real_cred` (+0x778) must equal `cred`, and the high dwor
 
 ---
 
+## 5b. THE reliability lever: keep the GPU busy (measured)
+
+The SMMU-table update races a **GPU context switch**, so the primitives succeed far more often while the
+GPU is actually working. Measured on device with the same 13-dword patch:
+
+| condition | dwords verified |
+|---|---|
+| GPU idle | **0-2 / 13** |
+| GPU busy (`screenrecord --time-limit 900 ... &`) | **11-13 / 13** |
+
+Consequences baked into the tooling:
+- `scripts/patch-dwords.sh` starts a synthetic GPU load for **every** mode, including `verify` —
+  reads race too, so an idle-GPU "verify" can report garbage and make a good patch look broken.
+- The load must cover the whole operation (patch, root call, screenshot, restore), not just the writes.
+- A run that cannot complete must be followed by a **reboot**: a partially patched `__do_sys_capset` will
+  panic the device the moment anything calls `capset` (observed twice). The scripts auto-restore on
+  partial failure, but if the device dies first, reboot is the fix — text is reloaded pristine.
+
 ## 6. Gotchas that cost real time (read before debugging)
 
 - **The primitive is a RACE, and losing it costs you the context.** The drawstate issues

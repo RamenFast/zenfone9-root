@@ -9,7 +9,8 @@
 # Requires on device: /data/local/tmp/cheese_pa (GPU primitive), /data/local/tmp/call_capset.
 # Scope: owner-authorized research on the spare, backed-up device. Leaves kernel text pristine.
 set -u
-S=${ZF9_SERIAL:?set ZF9_SERIAL to your device serial}
+[ -f "$(dirname "$0")/../device.env" ] && . "$(dirname "$0")/../device.env"
+S=${ZF9_SERIAL:?set ZF9_SERIAL (or create device.env)}
 DIR=$(cd "$(dirname "$0")" && pwd)
 CMD=${*:-id}
 

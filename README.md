@@ -58,6 +58,9 @@ the restore by readback.
   vs the command that uses it): losing it causes a GPU page fault, and KGSL then throttles that context
   (`gpu fault threshold exceeded 3 faults in 3000 msecs`), after which further commands fail with
   `EPERM`. Observed patch success varies between 13/13 and 2/13 dwords across runs.
+- **Keep the GPU busy.** The primitive races a GPU context switch: the same 13-dword patch verified
+  0-2/13 dwords with an idle GPU and **11-13/13** with a `screenrecord` load running. The scripts start
+  their own load for every operation (reads race too), but never run these tools' internals bare.
 - **A partially patched function is dangerous** (a `capset` caller can execute garbage). The scripts
   write the entry instruction last, verify every dword, and restore on failure — but if a run degrades,
   **reboot** before retrying.

