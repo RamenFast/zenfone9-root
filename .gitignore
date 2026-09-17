@@ -1,0 +1,27 @@
+# Large firmware artifacts — never commit (11 GB): OTA zip, extracted partitions, kernel image
+artifacts/
+!artifacts/.gitkeep
+
+# Device logs, screenshots, sweep logs
+logs/
+
+# Build outputs / local toolchain
+.venv/
+*.o
+*.zip
+*.tar.gz
+apk-extract/
+ndk/
+
+# Editor / OS noise
+*.swp
+.DS_Store
+
+# Compiled tools (build with scripts/build.sh)
+src/cheese
+src/cheese_pa
+src/cheese_big
+src/cheese_scan
+src/call_capset
+src/pa_leak
+src/host_kallsyms
