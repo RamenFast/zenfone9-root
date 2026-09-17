@@ -53,7 +53,8 @@ trap restore EXIT INT TERM
 adb -s "$S" push "$DIR/../src/proof.sh" /data/local/tmp/proof.sh </dev/null >/dev/null
 adb -s "$S" shell 'chmod 755 /data/local/tmp/proof.sh' </dev/null >/dev/null
 
-echo "[demo] SELinux -> Permissive"
+gpu_load_start   # must be running before ANY GPU-primitive op, including the SELinux flip
+echo "[demo] SELinux -> Permissive (GPU load active)"
 sel 0x01010000 Permissive || { echo "[demo] SELinux flip FAILED - aborting before patch"; exit 1; }
 echo "[demo] getenforce: $(adb -s "$S" shell getenforce </dev/null 2>&1)"
 

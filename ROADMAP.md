@@ -140,6 +140,30 @@ Consequences baked into the tooling:
   panic the device the moment anything calls `capset` (observed twice). The scripts auto-restore on
   partial failure, but if the device dies first, reboot is the fix — text is reloaded pristine.
 
+## 5c. Write reliability is PAGE-DEPENDENT (open issue, measured)
+
+Writes do not behave the same on every target page:
+
+| target | result |
+|---|---|
+| kernel text page `0xa8145000` (`__do_sys_capset`) | writes land: 11-13/13 dwords verified under GPU load |
+| `selinux_state` page `0xaaa40000` (`0xaaa40b98`) | write **refused right now**: readback stays `0x01010001` across 12 attempts, with and without load |
+
+Both pages read correctly, and the kernel-image magic still reads at `0xa8000038`, so addresses and the
+primitive are fine — it is the *store* to that page that does not take. Note this same write **did** work
+earlier in the project (SELinux was successfully flipped to Permissive twice), so the behaviour is
+state-dependent rather than a fixed protection.
+
+Diagnostic to run next: write-test several kernel-data addresses (each with a distinctive value, then
+restore) to find whether the boundary is per-page, per-region (`.bss` vs `.text`), or time-dependent;
+and re-test immediately after a fresh boot. Candidate explanations to rule out: hypervisor stage-2 write
+protection over kernel `.bss`, a stray dirty CPU line being written back over our store, or a runtime
+re-assert of that specific field.
+
+Consequence: the end-to-end demo (permissive SELinux → patch → root → on-screen proof) is blocked on
+this, because it needs the SELinux flip. The text patch itself — the part root actually needs — is
+already reliable under GPU load.
+
 ## 6. Gotchas that cost real time (read before debugging)
 
 - **The primitive is a RACE, and losing it costs you the context.** The drawstate issues
