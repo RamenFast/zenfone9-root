@@ -12,6 +12,26 @@
 set -u
 [ -f "$(dirname "$0")/../device.env" ] && . "$(dirname "$0")/../device.env"
 S=${ZF9_SERIAL:?set ZF9_SERIAL (or create device.env)}
+
+# --- GPU activity harness -------------------------------------------------------------
+# The primitives only take effect while the display is awake and the GPU is actively rendering.
+# A background screenrecord is NOT sufficient (measured 0/4 writes idle/dark vs 3/4 awake+animating).
+gpu_anim_start() {
+    # idempotent: don't disturb an animation the caller already started
+    if adb -s "$S" shell 'pgrep -f anim.sh >/dev/null 2>&1' </dev/null >/dev/null 2>&1; then
+        adb -s "$S" shell 'input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard' </dev/null >/dev/null 2>&1
+        return 0
+    fi
+    adb -s "$S" push "$(dirname "$0")/../src/anim.sh" /data/local/tmp/anim.sh </dev/null >/dev/null 2>&1
+    adb -s "$S" shell 'chmod 755 /data/local/tmp/anim.sh; svc power stayon true' </dev/null >/dev/null 2>&1
+    adb -s "$S" shell 'input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard' </dev/null >/dev/null 2>&1
+    adb -s "$S" shell 'nohup sh /data/local/tmp/anim.sh >/dev/null 2>&1 &' </dev/null >/dev/null 2>&1
+    sleep 3
+}
+gpu_anim_stop() {
+    adb -s "$S" shell 'pkill -f anim.sh' </dev/null >/dev/null 2>&1
+    adb -s "$S" shell 'svc power stayon false' </dev/null >/dev/null 2>&1
+}
 BIN=/data/local/tmp/cheese_pa
 BASE=0xa8145af0
 
@@ -23,11 +43,6 @@ orig=(0xd503233f 0xd10203ff 0xf800865e 0xa9047bfd 0xa9055ff8 0xa90657f6 \
 
 # The SMMU-update race is won far more often while the GPU is actually busy (measured: 11/13 with a
 # GPU load running vs 0-2/13 idle). So keep a synthetic GPU load alive for the whole patch.
-gpu_load_start() {
-    adb -s "$S" shell 'pkill -f screenrecord 2>/dev/null; screenrecord --time-limit 900 /data/local/tmp/gpuload.mp4 >/dev/null 2>&1 &' </dev/null >/dev/null 2>&1
-    sleep 2
-}
-gpu_load_stop() { adb -s "$S" shell 'pkill -f screenrecord' </dev/null >/dev/null 2>&1; }
 
 addr_of() { printf '0x%x' $((BASE + 4 * $1)); }
 
@@ -86,8 +101,8 @@ do_verify() {
     echo "  => text is INCONSISTENT (reboot to restore)"; return 1
 }
 
-gpu_load_start                     # all GPU-primitive ops (reads included) race: keep the GPU busy
-trap gpu_load_stop EXIT INT TERM
+gpu_anim_start   # GPU must be actively rendering for any of this to take effect (see ROADMAP 5f).
+                 # Deliberately NOT stopped here: the caller keeps it alive across steps.
 
 case "${1:-write}" in
     write)   do_write write "${vals[@]}" ;;
