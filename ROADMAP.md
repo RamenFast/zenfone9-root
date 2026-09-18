@@ -140,29 +140,55 @@ Consequences baked into the tooling:
   panic the device the moment anything calls `capset` (observed twice). The scripts auto-restore on
   partial failure, but if the device dies first, reboot is the fix — text is reloaded pristine.
 
-## 5c. Write reliability is PAGE-DEPENDENT (open issue, measured)
+## 5c. Writes currently land ONLY in the self-map page (open issue, measured)
 
-Writes do not behave the same on every target page:
+**Update (later session).** The earlier "page-dependent" framing was too narrow. Ground-truth probes
+(`CHEESE_WRITE_SELFTEST` / `CHEESE_CMD_SELFTEST`, which write a magic value and verify it through the
+CPU where possible, not only through our own GPU readback) show:
 
-| target | result |
-|---|---|
-| kernel text page `0xa8145000` (`__do_sys_capset`) | writes land: 11-13/13 dwords verified under GPU load |
-| `selinux_state` page `0xaaa40000` (`0xaaa40b98`) | write **refused right now**: readback stays `0x01010001` across 12 attempts, with and without load |
+| what | command used | destination | result |
+|---|---|---|---|
+| completion marker | `CP_MEM_WRITE` via **self-map entry** (L3 idx 4) | table page + 0x100 | **lands** (observed `0x7100`, `0x7101`) |
+| copy, dst = table page | `CP_MEM_TO_MEM` via target entry (L3 idx 3) | table page + 0x600 | **landed** (CPU-verified `0x33333333`) |
+| data write | `CP_MEM_WRITE` via target entry | own user page (PA known via perf leak) | does **not** land (GPU readback still `0xaaaaaaaa`) |
+| data write | `CP_MEM_WRITE` via target entry | table page + 0x500 | does **not** land (CPU still sees `0x11111111`) |
+| data write | `CP_MEM_WRITE` via target entry | kernel `.bss` (`kptr_restrict` `0xaa78cde8`) | does **not** land |
+| data read | `CP_MEM_TO_MEM` via target entry | any of the above pages | **works reliably** |
 
-Both pages read correctly, and the kernel-image magic still reads at `0xa8000038`, so addresses and the
-primitive are fine — it is the *store* to that page that does not take. Note this same write **did** work
-earlier in the project (SELinux was successfully flipped to Permissive twice), so the behaviour is
-state-dependent rather than a fixed protection.
+So, at the moment: **reads work through the target entry; writes only take effect in the physical page
+the SMMU is using as its page table.** Verified independent of GPU load, of a fresh boot, of a fresh VA
+page (the table's extra entries), and of whether a `MEM_TO_MEM` preamble is emitted first. This is not
+yet explained. Candidates still standing: something re-asserts/rewrites those pages; a write path that
+only commits for the page-table page; or the SMMU refusing writes for pages outside some allowlist.
 
-Diagnostic to run next: write-test several kernel-data addresses (each with a distinctive value, then
-restore) to find whether the boundary is per-page, per-region (`.bss` vs `.text`), or time-dependent;
-and re-test immediately after a fresh boot. Candidate explanations to rule out: hypervisor stage-2 write
-protection over kernel `.bss`, a stray dirty CPU line being written back over our store, or a runtime
-re-assert of that specific field.
+Important context: this **used to work**. In the earlier session the same `CP_MEM_WRITE` path wrote 13
+dwords into kernel `.text` and root was achieved and verified (`uid=0(root)`, `u:r:kernel:s0`) — so the
+capability exists on this hardware and something about device state changed. It also means the earlier
+"11-13/13 verified" numbers came from *our own GPU readback*; where a page accepts no writes, that
+readback is trustworthy, but it cannot distinguish "write lost" from "write reverted" — hence the
+CPU-side verification added later.
 
-Consequence: the end-to-end demo (permissive SELinux → patch → root → on-screen proof) is blocked on
-this, because it needs the SELinux flip. The text patch itself — the part root actually needs — is
-already reliable under GPU load.
+Diagnostics that are now cheap and worth running: (a) do a write and *poll* the readback for a few
+seconds to separate "never landed" from "landed then reverted"; (b) test a `CP_MEM_TO_MEM` copy from the
+staged slot into a **kernel** page (copy, not `CP_MEM_WRITE`) — if copies land where writes do not, root
+becomes a copy-based patch; (c) test whether making the target page a KGSL-mapped buffer changes
+anything (KGSL's io-pagetable may carry the permissions the SMMU wants).
+
+Consequence: reproducing root is blocked on this, plus the SELinux flip which needs the same write path.
+
+## 5d. What is NOT the cause (tested and eliminated)
+
+- **Not page size/region**: fails for user pages (high bank) and kernel `.bss` alike.
+- **Not GPU idleness**: fails under a synthetic GPU load as well as idle. (Load *does* still matter for
+  winning the TTBR0 race — see §5b — so keep it for reads and for the cases that do work.)
+- **Not the setup-read poisoning the VA page** (SMMU TLB staleness): writing through a *fresh* VA page
+  (the table's extra entries, `g_write_va_extra`) behaves identically.
+- **Not accumulated GPU fault state**: identical behaviour immediately after a reboot.
+- **Not a `CP_MEM_WRITE`-vs-`MEM_TO_MEM` ordering problem**: adding a `MEM_TO_MEM` preamble before the
+  write (`g_write_preamble`) does not make the write land.
+- **Not the packet encoding**: `cp_gpuaddr` emits `[lo, hi]` and `cp_type7_packet` sets odd parity, so
+  `count = 2 + N` is correct (and this exact code path patched kernel text successfully earlier).
+
 
 ## 6. Gotchas that cost real time (read before debugging)
 
