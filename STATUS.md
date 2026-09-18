@@ -277,3 +277,51 @@ Three separate runs of `scripts/root-usable.sh` landed the patch 16/16 verified 
 usable uid-0 session; `PHASE=stop` leaves the session live for interactive work
 (`adb shell "/data/local/tmp/call_capset sh -c '...'"`), `KEEP=1` keeps it live too. Reboot remains the
 failsafe: after reboot the text is pristine, SELinux is Enforcing, and the module is gone (not persistent).
+
+
+## Round 11 (2026-09-17): KernelSU's manager<->kernel link verified; on-screen proof deferred to a fresh boot
+
+Verified in the same boot as the round-10 late-load (10+ minutes later, no re-patch):
+
+```
+$ adb shell su -c id
+uid=0(root) gid=0(root) groups=0(root) context=u:r:ksu:s0
+/proc/modules : kernelsu 200704 0 - Live
+```
+So the late-loaded module and `su` stay functional for the whole boot.
+
+The manager app really does talk to the kernel - logcat during launch:
+
+```
+KERNEL: KernelSU: handle_setresuid from 0 to 10208
+KERNEL: KernelSU: install fd for manager: 10208
+KERNEL: KernelSU: ksu fd installed: 3 for pid 18145
+```
+
+but its **UI never renders** (splash, then it gets backgrounded). That is the documented late-load caveat,
+now measured rather than assumed.
+
+### New finding: after the late-load, this boot's Android UI is unreliable
+
+Symptoms, all on the post-late-load boot: launcher pinned to the app drawer (BACK/HOME would not dismiss
+it), the KernelSU manager never rendering, Settings' About page wedging after a force-stop,
+`cmd statusbar expand-notifications` returning rc=0 while visibly doing nothing, and notifications that
+`cmd notification post` claims to post never appearing (`dumpsys notification` finds none). Round 10's
+"activity manager unreachable" is the same theme. Consequence:
+
+**The on-screen root proof must be captured on a fresh boot WITHOUT the KernelSU module loaded** - i.e.
+patch temporary root, take the proof, and only then run `ksud late-load`. That is exactly what rounds 6-7
+did (`logs/final-20260917-183323/root-proof-notification.png`, a `cmd notification post` executed from the
+rooted process while permissive).
+
+### Also learned (routes ruled out)
+
+* The HTML proof page cannot be shown by another app: FUSE gives `/sdcard/root-proof.html` the owner
+  `u0_a181 media_rw` mode 0660 and **root cannot chmod it** (FUSE ignores it), so Chrome/Files cannot read
+  it, and no installed app handles `file://` + `text/html` anyway (Chrome has its own first-run flow).
+* `am start -a android.settings.DEVICE_INFO_SETTINGS` worked exactly once (captured
+  `logs/ksu-verified/proof-about.png`) and then wedged; the device-name hypothesis (`settings put global
+  device_name`) is therefore not a dependable proof surface either. The device name was restored to the
+  model string afterwards.
+* Screen state matters: `--stay-on` was disabled during this round (`stay_on_while_plugged_in 0`), which
+  produced several black captures before that was spotted. It is restored to 15.
