@@ -282,3 +282,16 @@ rooted process while permissive).
   model string afterwards.
 * Screen state matters: `--stay-on` was disabled during this round (`stay_on_while_plugged_in 0`), which
   produced several black captures before that was spotted. It is restored to 15.
+
+
+### Round 11 addendum (end of session)
+
+Two more full runs of `scripts/root-usable.sh` reproduced the patch (16/16 verified dwords) and the
+permissive flip, i.e. temporary root is repeatable run after run. The on-screen proof capture is wired
+into the script's tail (`src/proof.sh` posts the notification as ROOT, then the shade is opened and
+`root-proof-screen.png` is captured) but has not yet produced a good frame: this device's SystemUI stops
+accepting shell notifications and stops expanding the shade after the UI has been poked at (they worked
+on the 18:38 boot), and with KernelSU's LKM loaded the userspace is unreliable by design of late-load.
+Next session: run the full flow on a fresh boot and let it take the proof *before* the KernelSU stage
+(the proof stage currently sits after it), or move that stage earlier in `scripts/root-usable.sh`.
+Device left rebooted and clean; repo pushed.

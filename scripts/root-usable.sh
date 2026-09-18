@@ -195,11 +195,16 @@ adb -s "$S" push "$DIR/../src/ksu-lateload.sh" /data/local/tmp/ksu-lateload.sh <
 adb_s 'chmod 755 /data/local/tmp/ksu-lateload.sh' >/dev/null
 adb -s "$S" shell "/data/local/tmp/call_capset sh /data/local/tmp/ksu-lateload.sh" </dev/null 2>&1 | tee "$LOG/ksu.txt" | tail -40
 
-echo "[usable] === on-screen proof ==="
-adb_s 'am start -a android.intent.action.VIEW -d file:///sdcard/root-proof.html -t text/html' >/dev/null
-sleep 4
+echo "[usable] === on-screen proof: post the root proof as ROOT, then open the shade ==="
+adb -s "$S" push "$DIR/../src/proof.sh" /data/local/tmp/proof.sh </dev/null >/dev/null 2>&1
+adb_s 'chmod 755 /data/local/tmp/proof.sh' >/dev/null
+adb -s "$S" shell "/data/local/tmp/call_capset sh /data/local/tmp/proof.sh" </dev/null 2>&1 | tee "$LOG/proof.txt" | tail -14
+sleep 2
+adb_s 'cmd statusbar expand-notifications' >/dev/null 2>&1
+sleep 3
 adb -s "$S" exec-out screencap -p > "$LOG/root-proof-screen.png" 2>/dev/null
-echo "[usable] screenshot: $LOG/root-proof-screen.png ($(du -h "$LOG/root-proof-screen.png" 2>/dev/null | cut -f1))"
+echo "[usable] screenshot: $LOG/root-proof-screen.png ($(stat -c%s "$LOG/root-proof-screen.png" 2>/dev/null) bytes)"
+adb_s 'dumpsys window 2>/dev/null | grep -m1 mCurrentFocus'
 
 echo "[usable] === putting SELinux back to enforcing (as root), then restoring the kernel text ==="
 adb -s "$S" shell "/data/local/tmp/call_capset sh -c 'echo 1 > /sys/fs/selinux/enforce; getenforce'" </dev/null 2>&1 | tail -2
