@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <sys/syscall.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 
 static void first_line(const char *path, char *out, size_t n) {
     FILE *f = fopen(path, "r");
@@ -45,6 +47,50 @@ static void list_dir(const char *path, char *out, size_t n) {
     if (!used) snprintf(out, n, "(empty)");
 }
 
+
+static void probe(const char *what, int ok, int e) {
+    printf("PROBE %-34s %s%s\n", what, ok ? "ALLOWED" : "DENIED", ok ? "" : (e ? strerror(e) : ""));
+}
+
+static void run_probes(void) {
+    int fd, e;
+    /* read a root-only file */
+    errno = 0; fd = open("/proc/kallsyms", O_RDONLY); e = errno;
+    probe("open /proc/kallsyms", fd >= 0, e); if (fd >= 0) close(fd);
+    /* write inside /data (exec-allowed, writable) */
+    errno = 0; fd = open("/data/local/tmp/reed-probe.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644); e = errno;
+    probe("write /data/local/tmp", fd >= 0, e);
+    if (fd >= 0) { write(fd, "x", 1); close(fd); }
+    /* write through the sdcard FUSE layer */
+    errno = 0; fd = open("/sdcard/reed-probe.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644); e = errno;
+    probe("write /sdcard (FUSE)", fd >= 0, e); if (fd >= 0) close(fd);
+    /* open the GPU node (KernelSU/other tooling may want device nodes) */
+    errno = 0; fd = open("/dev/kgsl-3d0", O_RDWR); e = errno;
+    probe("open /dev/kgsl-3d0", fd >= 0, e); if (fd >= 0) close(fd);
+    /* can we BLOCK device nodes? this is what writing a boot image would need */
+    errno = 0; fd = open("/dev/block/by-name/boot_a", O_RDWR); e = errno;
+    probe("open /dev/block/by-name/boot_a", fd >= 0, e); if (fd >= 0) close(fd);
+    /* exec a system binary (fork+wait so we survive) */
+    {
+        pid_t pid = fork();
+        if (pid == 0) { execl("/system/bin/id", "id", (char *)0); _exit(126); }
+        int st = 0; waitpid(pid, &st, 0);
+        probe("exec /system/bin/id", WIFEXITED(st) && WEXITSTATUS(st) == 0, 0);
+    }
+    /* THE KernelSU question: is module loading permitted at all?
+     * init_module with a bogus image: EPERM/EACCES => blocked; ENOEXEC/EINVAL => permitted. */
+    {
+        static char junk[64];
+        errno = 0;
+        long r = syscall(__NR_init_module, junk, sizeof(junk), "");
+        int err = errno;
+        printf("PROBE %-34s rc=%ld errno=%d (%s) => %s\n", "init_module (bogus image)", r, err,
+               strerror(err),
+               (err == EPERM || err == EACCES) ? "BLOCKED (no late-load)"
+                                               : "PERMITTED (late-load viable)");
+    }
+}
+
 int main(int argc, char **argv) {
     long r = syscall(SYS_capset, (void *)0, (void *)0);
     int rooted = (getuid() == 0 || geteuid() == 0);
@@ -53,6 +99,8 @@ int main(int argc, char **argv) {
     printf("uid=%d euid=%d gid=%d  %s\n", getuid(), geteuid(), getgid(),
            rooted ? "*** ROOT ***" : "(not root - kernel text not patched?)");
     if (!rooted) return 1;
+
+    if (argc == 1) run_probes();          /* what can this rooted process actually do? */
 
     if (argc > 1) {                      /* diagnostic path: exec while root */
         execvp(argv[1], &argv[1]);

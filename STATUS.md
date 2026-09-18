@@ -77,3 +77,46 @@ primitive + POKE/PROBE/SELFTEST/ROOT modes) · `src/pa_leak.{c,h}` · `src/call_
 `src/host_kallsyms.c` (offline resolver) · `scripts/root-now.sh`, `scripts/patch-dwords.sh` ·
 `artifacts/` (SHA-256-verified ASUS OTA, extracted partitions, `kernel.Image`) ·
 `~/Videos/Zenfone9-backup-NhZOcgfg`.
+
+---
+
+## ROOT ACHIEVED (round 6-7) — and the precise limitation
+
+**Working configuration** (`scripts/root-final.sh`), verified on hardware repeatedly:
+
+```
+capset(NULL,NULL) -> 0 errno=0 (Success)
+uid=0 euid=0 gid=0  *** ROOT ***
+CapEff: 000001ffffffffff
+```
+On-screen proof: `logs/final-20260917-183323/root-proof-notification.png`.
+
+Recipe: GPU actively rendering (verified) → stage `mov w0,wzr; ret` in an unreachable code cave and
+branch `avc_has_perm`'s entry to it with ONE atomic dword → patch `__do_sys_capset` with the 3-dword
+P1 tail-call (`adrp x0,<init_cred>; add x0,x0,#off; b commit_creds`) → trigger `capset()` in a fresh
+process. Every write accepted only on a SEPARATE-process readback. Three writes instead of thirteen
+is what keeps the window short enough that the device survives.
+
+**Limitation (measured, round 7).** Although the process has uid 0 and the full capability set, every
+practical operation is DENIED: `/proc/kallsyms`, writes to `/data/local/tmp` and `/sdcard`, opening
+`/dev/kgsl-3d0`, opening block devices, `execve`, and **`init_module` → EPERM**. Reason:
+`commit_creds(&init_cred)` moves the task into the **kernel** SELinux domain (init_cred's SID), and
+Android's policy grants that domain *fewer* userspace permissions than the `shell` domain we started
+in. So uid 0 alone is not useful here — the domain is what matters.
+
+**Consequence: KernelSU late-load is blocked in this configuration** (module loading is EPERM), and so
+is `exec`-based tooling.
+
+**Two facts that shape the fix:**
+1. Text patches take effect for **cold** functions (`__do_sys_capset` — the shellcode executed) but not
+   for **hot** ones (`avc_has_perm` is called on every permission check and stays in the I-cache, so our
+   branch there never runs). Patching a hot function cannot be relied on.
+2. The SELinux *state* byte cannot be written from the GPU (hot data line; the CPU's writeback clobbers
+   the store — see §5c).
+
+**Next step (clear):** keep our own SELinux domain while gaining uid 0. A text-only patch can
+`bl prepare_creds` (which *copies our current cred*, preserving our `shell` SID), zero the uid/gid
+fields and fill the capability set, then `bl commit_creds`. That yields root **with the shell domain's
+permissions** — the ability to write `/data`, exec, open device nodes — which is what both the proof
+and KernelSU need. The offsets for the uid block and the capability set can be found by reading our own
+cred (reads are reliable) after locating it via the `init_task` walk with the VA→PA delta.
