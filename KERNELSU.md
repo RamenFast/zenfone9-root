@@ -180,3 +180,57 @@ sepolicy, and the `su` plumbing) must complete before this counts as "KernelSU i
 3. Only then verify `su -c id` from an unpatched shell, and take a fresh on-screen proof screenshot
    (this round's `screencap` came back 0 bytes because the system was already degraded by then).
 4. Keep the session's permissive flip sticky while ksud runs (vendor services re-assert enforcing).
+
+
+## Round 10 (2026-09-17): KernelSU late-load VERIFIED WORKING (su -> u:r:ksu:s0)
+
+From a permissive + rooted session, `ksud late-load --kmi android12-5.10 --allow-shell` does the whole
+job - it loads the module *and* completes its userspace install:
+
+```
+/proc/modules : kernelsu 200704 0 - Live 0x0000000000000000 (O)
+/data/adb     : ksud (6286568 B), ksu/bin/                 # created by ksud itself
+```
+
+Verified from a **fresh, unpatched adb shell** (uid 2000, no exploit involved, SELinux Enforcing):
+
+```
+$ adb shell id
+uid=2000(shell) ... context=u:r:shell:s0
+$ adb shell su -c id
+uid=0(root) gid=0(root) groups=0(root) context=u:r:ksu:s0
+kernel log: KernelSU: sys_execve su found
+```
+
+That is KernelSU's own root path working with no help from our exploit. Evidence:
+`logs/ksu-verified/{ksu-state.txt,ksu-manager*.png,root-proof-*.png}`.
+
+### The key insight that explains round 9
+
+**Late-load re-enables SELinux enforcing** (its documented behaviour). Under Enforcing, the *exploit's*
+root - uid 0 but SID still `u:r:shell:s0` - loses `dac_override`, so shell-owned paths
+(`/data/local/tmp`, and `/data/adb` by label) come back EACCES despite uid 0 + full caps, while
+root-owned `/data/adb` stays reachable. Consequences:
+
+* after late-load, do post-load work through KernelSU's `su` (`u:r:ksu:s0`), not the exploit's uid 0;
+* `scripts/root-usable.sh` should re-flip permissive *after* late-load if the exploit is to keep doing
+  privileged work;
+* round 9's "empty ksud.log + /data/adb EACCES" was this, not a broken module.
+
+### Still open (both cosmetic/verification, not functional)
+
+1. The manager APK's UI stays on its splash screen (even after force-stop + restart, i.e. the
+   documented late-load caveat). `su` works regardless.
+2. A *fresh* on-screen root proof was not captured this round: `cmd statusbar expand-notifications` is
+   ineffective from shell/root here, my swipes opened the app drawer instead, and Chrome cannot read the
+   root-written `/sdcard/root-proof.html` (FUSE assigns it `u0_a181 media_rw 0660`). The screen evidence
+   captured is the KernelSU app icon/manager. Next attempt should `su -c 'chmod 644 /sdcard/root-proof.html'`
+   (or write the page via `su` to a world-readable path) before opening it, and close the app drawer
+   (BACK twice) before swiping the shade from y=0.
+
+### Root status: repeatable
+
+Three separate runs of `scripts/root-usable.sh` landed the patch 16/16 verified dwords and produced a
+usable uid-0 session; `PHASE=stop` leaves the session live for interactive work
+(`adb shell "/data/local/tmp/call_capset sh -c '...'"`), `KEEP=1` keeps it live too. Reboot remains the
+failsafe: after reboot the text is pristine, SELinux is Enforcing, and the module is gone (not persistent).

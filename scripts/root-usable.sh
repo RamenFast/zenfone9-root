@@ -33,6 +33,7 @@ PATCH_ADDR=0xa8145af0     # __do_sys_capset
 AVC_ADDR=0xa88bb740       # avc_has_perm
 AVC_CAVE=0xa801c7e4       # 7 dwords of inert NOP padding after a function tail
 KEEP=${KEEP:-0}
+PHASE=${PHASE:-full}   # PHASE=stop => patch, root, verify, then LEAVE the session live for manual work
 
 ORIG=(d503233f d10203ff f800865e a9047bfd a9055ff8 a90657f6 a9074ff4 910103fd \
       90010d28 f9448908 aa0103f4 910073e1 aa0003f5 f81f83a8 a902ffff f90013ff)
@@ -176,6 +177,13 @@ echo "[usable] === USABILITY as root (fork+exec from the rooted process) ==="
 adb -s "$S" push "$LOG/rootcheck.sh" /data/local/tmp/rootcheck.sh </dev/null >/dev/null 2>&1
 adb_s 'chmod 755 /data/local/tmp/rootcheck.sh' >/dev/null
 adb -s "$S" shell "/data/local/tmp/call_capset sh /data/local/tmp/rootcheck.sh" </dev/null 2>&1 | tee "$LOG/rootcheck.txt" | tail -22
+
+if [ "$PHASE" = stop ]; then
+    echo "[usable] PHASE=stop -> patches left LIVE (root on demand: /data/local/tmp/call_capset [cmd])"
+    echo "[usable] root: adb shell /data/local/tmp/call_capset ; root cmd: adb shell \"/data/local/tmp/call_capset sh -c '...'\""
+    trap - EXIT INT TERM
+    exit 0
+fi
 
 echo "[usable] === installing the KernelSU manager APK (must precede late-load: the .ko verifies the manager by APK cert hash) ==="
 adb -s "$S" install -r -d "$DIR/../artifacts/kernelsu/KernelSU_v3.3.0_32601-release.apk" </dev/null 2>&1 | tail -2
