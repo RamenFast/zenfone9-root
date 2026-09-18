@@ -190,6 +190,65 @@ Consequence: reproducing root is blocked on this, plus the SELinux flip which ne
   `count = 2 + N` is correct (and this exact code path patched kernel text successfully earlier).
 
 
+## 5e. Round-3 findings: a measurement bug, and a strategy reversal
+
+**Established from the image's embedded config** (decompressed out of `kernel.Image`, `IKCFG_ST` at file
+offset `0x1a34220` — an independent analysis pass did this read-only):
+
+- `CONFIG_ARM64_VA_BITS=39` — settles the VA-layout question. Kernel VA space is
+  `0xffffffc000000000`–`0xffffffffffffffff`; the `0xffffffee…` runtime pointers are just KASLR placing the
+  image high. Nothing in the write/read mechanism depends on this.
+- `CONFIG_STATIC_USERMODEHELPER=y` with an **empty** path → in 5.10 `umh.c` every `call_usermodehelper`
+  becomes a no-op. **`modprobe_path`, `core_pattern`, `uevent_helper` tricks are dead here.** Don't spend
+  time on them.
+- `MODULE_SIG` / `MODULE_SIG_FORCE` / `MODULE_FORCE_LOAD` all **not set** → `ksud late-load`'s
+  vermagic-rewrite route is unobstructed (relevant to `KERNELSU.md`).
+- `CFI_CLANG=y` (non-permissive), no randstruct → struct field order is source order.
+- Sections (physical): text `0xa8010000`–`0xa9a30000` | rodata `0xa9a30000`–`0xaa46c000` | init
+  `0xaa480000`–`0xaa780000` | data `0xaa780000`–`0xaa988000` | bss `0xaa988000`–`0xaaa7fc1c`.
+  So `selinux_state` (`0xaaa40b98`) is in **.bss** (writable, zero-init — *not* rodata), and
+  `sys_call_table` (`0xaa129578`) is in **.rodata** (read on every syscall — a worse patch target).
+- Enumerating every load/store against the `selinux_state` page found **no store to the `enforcing`
+  byte anywhere in the kernel** → the "something re-asserts it" theory is refuted for kernel-side writes.
+
+**The measurement bug (important).** With `CHEESE_NO_RETRY=1`, a KGSL-throttled ioctl means our write
+command is *never submitted*, and the harness prints the initial value plus `FAILED` — textually
+identical to a store that was submitted and lost. Every "does not land" observation in §5c must be read
+with that caveat. Compounding it, `kgsl_gpu_command_payload` returns the raw ioctl return without setting
+`errno`, so any `strerror(errno)` in those paths can print a stale message. **Fix before drawing further
+conclusions:** report the ioctl return code explicitly, and use the *kernel's own cacheable view* as the
+acceptance criterion (e.g. `getenforce`, `getuid`) rather than our GPU readback.
+
+**Cold-page test (run, negative).** A provably cold, symbol-free page in the `__bss_stop.._end` gap
+(`0xaaa8f000`, verified zeros, never read or allocated) did **not** accept a store: readback stayed `0x0`
+immediately and at t+2 s and t+10 s. So "the target line is dirty/hot" is not sufficient to explain the
+failures either — the pending explanation is that the command frequently is not executed at all
+(throttle), which the fix above will disambiguate.
+
+**Strategy reversal (this is the unlock).** The dependency we assumed — Permissive SELinux *before* the
+patch — is not required, and flipping `selinux_state` from the GPU is the *worst* way to get permissive
+(it is a hot, syscall-rate line; and it needs the write path we are debugging). Instead:
+
+1. **Become root first** via the kernel-text patch. `.text` lines are permanently CPU-clean, which is the
+   one class of page where a non-cacheable device store is guaranteed to survive.
+2. **Then flip SELinux from the rooted process**: it lands in `u:r:kernel:s0` with `CAP_MAC_ADMIN`, so
+   `setenforce 0` is an ordinary privileged CPU-side store — no coherency problem at all.
+3. This also deletes the dangerous "patched text + permissive" window that rebooted the device twice.
+
+**Reliability lever for step 1:** per the same analysis, TTBR0 does *not* persist across context
+switches, so the goal is *fewer race windows*, not more retries. The `CP_MEM_TO_MEM` bulk-copy path
+already exists (`g_write_via_copy` + `cheese_stage_dword`) but is currently wired only into self-tests;
+promoting it into the write path turns a 13-command patch into a **single** race window.
+
+**Best alternative root primitive (no text patch, no permissive SELinux):** rewrite our own
+`struct cred` *contents* — zero `cred+0x04..0x1c` (uid…fsgid; uid is at offset 4 on this config).
+Failure is inert (no partial-shellcode panic), `getuid()` is a free kernel-side oracle, and because the
+SELinux SID is untouched, enforcing SELinux is fine. Locate the cred by walking `init_task.tasks`
+(list_head at ~+0x580 — verify) matching `pid` from `/proc/self/stat`; convert kernel VA→PA using the
+delta derived from `init_task.cred` (you already read that pointer): `D = rt_cred_runtime - 0xaa7b0ae0`,
+then `PA = VA - D`, cross-validated against ≥3 independent pointers. Sanity check while reading:
+eight consecutive `0x000007d0` (=2000) values at `cred+0x04` is the uid block for our shell process.
+
 ## 6. Gotchas that cost real time (read before debugging)
 
 - **The primitive is a RACE, and losing it costs you the context.** The drawstate issues
