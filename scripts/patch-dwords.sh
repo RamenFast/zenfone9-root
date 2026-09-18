@@ -52,17 +52,22 @@ timeout 120 $BIN > /data/local/tmp/pr.txt 2>&1; grep -o 'value=0x[0-9a-f]*' /dat
     </dev/null 2>&1 | tr -d '\r' | sed 's/value=//'
 }
 
-write_dword() {  # $1 = index, $2 = value -> echoes VERIFIED / FAILED; retries across fresh processes
-    local a line
+write_dword() {  # $1 = index, $2 = value -> VERIFIED / FAILED
+    # NOTE: the POKE path's own readback is NOT trusted - within one process the SMMU caches the
+    # translation of the VA page the first GPU op used, so a later read in the same process can
+    # "confirm" a write through a stale translation (this produced spurious VERIFIED results for a
+    # whole session). Acceptance must come from a SEPARATE process: fresh context, fresh translation.
+    local a v_expected=$2 got i
     a=$(addr_of "$1")
-    for attempt in 1 2 3 4 5; do
-        line=$(adb -s "$S" shell "CHEESE_POKE=1 CHEESE_NO_RETRY=1 CHEESE_TARGET_PA=$a \
-CHEESE_WRITE_PA=$a CHEESE_WRITE_VAL=$2 timeout 180 $BIN > /data/local/tmp/pk.txt 2>&1; \
-grep -o 'POKE write.*' /data/local/tmp/pk.txt | tail -1" </dev/null 2>&1 | tr -d '\r')
-        printf '%s' "$line" | grep -q VERIFIED && { echo VERIFIED; return 0; }
+    for i in 1 2 3; do
+        adb -s "$S" shell "CHEESE_POKE=1 CHEESE_NO_RETRY=1 CHEESE_TARGET_PA=$a CHEESE_WRITE_PA=$a \
+CHEESE_WRITE_VAL=$v_expected timeout 240 $BIN > /data/local/tmp/pk.txt 2>&1" </dev/null >/dev/null 2>&1
         sleep 2
+        got=$(read_dword "$1")
+        if [ "$got" = "$v_expected" ]; then echo VERIFIED; return 0; fi
+        echo "  (attempt $i: separate-process read gave $got, want $v_expected)"
     done
-    echo "FAILED: $line"
+    echo "FAILED: read back $got"
     return 1
 }
 
