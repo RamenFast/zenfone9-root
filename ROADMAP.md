@@ -381,3 +381,51 @@ mid-session), verifying `su`, and installing the manager APK.
 * `avc_has_perm_noaudit 0xa88bb5d8`; `prepare_creds 0xa8184580`; `memcpy 0xa801f680`;
   `commit_creds 0xa8184c94`; `init_cred 0xaa7b0ae0`; `selinux_state 0xaaa40b98`; cave `0xa801c7e4`
   (7 NOP dwords only - too small for shellcode, fine for the 2-dword `mov w0,wzr; ret` gadget).
+
+
+## Round 9 (2026-09-17): permissive root fully usable; KernelSU LKM loads but is not yet a stable end state
+
+With the round-8 recipe (permissive byte 0 + 16-dword cred shellcode), **every probe now returns
+ALLOWED** as the rooted process — the whole "root that can't do anything" problem is gone:
+
+```
+PROBE open /proc/kallsyms                ALLOWED
+PROBE write /data/local/tmp              ALLOWED
+PROBE write /sdcard (FUSE)               ALLOWED
+PROBE open /dev/kgsl-3d0                 ALLOWED
+PROBE open /dev/block/by-name/boot_a     ALLOWED
+PROBE exec /system/bin/id                ALLOWED
+PROBE init_module (bogus image)          rc=-1 errno=8 (Exec format error) => PERMITTED
+CapEff: 000001ffffffffff   context=u:r:shell:s0
+```
+Evidence: `logs/usable-20260917-191347/{root.txt,rootcheck.txt,ksu.txt}`.
+
+Also verified: with root + permissive, `setenforce 0` succeeds through the **kernel's own** selinuxfs
+interface (not just our patched byte), i.e. the permissive state becomes official.
+
+### KernelSU v3.3.0 (manager APK installed first, then late-load)
+
+```
+kernelsu 200704 0 - Live 0x0000000000000000 (O)      # /proc/modules, reproduced twice
+```
+The LKM **does load**. What does not yet work:
+
+* `ksud.log` stays empty and `/data/adb` returns EACCES *even as uid 0 with permissive SELinux and
+  CAP_DAC_OVERRIDE working elsewhere* (writes to /data/local/tmp and /sdcard succeed in the same
+  session, so this is not a capability problem).
+* `su` is not found, so KernelSU's own root path is unverified.
+* With the module live the system degraded (activity manager unreachable, `cmd: Can't find service:
+  package`), and the interrupted restore had to be abandoned; a reboot is the failsafe.
+
+So late-load gets the module in, but ksud's userspace stages (which create `/data/adb/ksud`, busybox,
+sepolicy, and the `su` plumbing) must complete before this counts as "KernelSU installed".
+
+### Next steps (in order)
+
+1. Run `ksud late-load` in the *foreground* with stdio captured, from a permissive root session, and
+   read its actual error (the empty log is the main unknown).
+2. Work out the `/data/adb` EACCES (label/ownership vs. our process) - possibly create it as
+   `root:root 0700` with the expected `adb_data_file`/`ksu_file` label *before* loading.
+3. Only then verify `su -c id` from an unpatched shell, and take a fresh on-screen proof screenshot
+   (this round's `screencap` came back 0 bytes because the system was already degraded by then).
+4. Keep the session's permissive flip sticky while ksud runs (vendor services re-assert enforcing).

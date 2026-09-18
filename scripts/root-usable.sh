@@ -177,14 +177,29 @@ adb -s "$S" push "$LOG/rootcheck.sh" /data/local/tmp/rootcheck.sh </dev/null >/d
 adb_s 'chmod 755 /data/local/tmp/rootcheck.sh' >/dev/null
 adb -s "$S" shell "/data/local/tmp/call_capset sh /data/local/tmp/rootcheck.sh" </dev/null 2>&1 | tee "$LOG/rootcheck.txt" | tail -22
 
+echo "[usable] === installing the KernelSU manager APK (must precede late-load: the .ko verifies the manager by APK cert hash) ==="
+adb -s "$S" install -r -d "$DIR/../artifacts/kernelsu/KernelSU_v3.3.0_32601-release.apk" </dev/null 2>&1 | tail -2
+
 echo "[usable] === KernelSU late-load from the rooted session ==="
 adb -s "$S" push "$DIR/../artifacts/kernelsu/ksud-aarch64-linux-android" /data/local/tmp/ksud </dev/null >/dev/null 2>&1
 adb -s "$S" push "$DIR/../artifacts/kernelsu/lkm-aarch64-android12-5.10_kernelsu.ko" /data/local/tmp/kernelsu.ko </dev/null >/dev/null 2>&1
 adb -s "$S" push "$DIR/../src/ksu-lateload.sh" /data/local/tmp/ksu-lateload.sh </dev/null >/dev/null 2>&1
-adb_s 'chmod 755 /data/local/tmp/ksu-lateload.sh; ls -l /data/local/tmp/ksud | head -1' >/dev/null
-adb -s "$S" shell "/data/local/tmp/call_capset sh /data/local/tmp/ksu-lateload.sh" </dev/null 2>&1 | tee "$LOG/ksu.txt" | tail -32
+adb_s 'chmod 755 /data/local/tmp/ksu-lateload.sh' >/dev/null
+adb -s "$S" shell "/data/local/tmp/call_capset sh /data/local/tmp/ksu-lateload.sh" </dev/null 2>&1 | tee "$LOG/ksu.txt" | tail -40
 
-if [ "$KEEP" = 1 ]; then echo "[usable] KEEP=1 -> patches left in place"; exit 0; fi
+echo "[usable] === on-screen proof ==="
+adb_s 'am start -a android.intent.action.VIEW -d file:///sdcard/root-proof.html -t text/html' >/dev/null
+sleep 4
+adb -s "$S" exec-out screencap -p > "$LOG/root-proof-screen.png" 2>/dev/null
+echo "[usable] screenshot: $LOG/root-proof-screen.png ($(du -h "$LOG/root-proof-screen.png" 2>/dev/null | cut -f1))"
+
+echo "[usable] === putting SELinux back to enforcing (as root), then restoring the kernel text ==="
+adb -s "$S" shell "/data/local/tmp/call_capset sh -c 'echo 1 > /sys/fs/selinux/enforce; getenforce'" </dev/null 2>&1 | tail -2
 restore
 trap - EXIT INT TERM
+
+echo "[usable] === KernelSU su test from a FRESH shell, with NO patch active ==="
+adb -s "$S" shell 'su -c id' </dev/null 2>&1 | tee "$LOG/su.txt" | head -3
+adb_s 'grep -i kernelsu /proc/modules || echo "(no kernelsu module)"'
+echo "[usable] getenforce=$(adb_s getenforce)  capset[0]=$(rd $PATCH_ADDR)"
 echo "[usable] logdir: $LOG"
